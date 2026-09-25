@@ -13,6 +13,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,7 +22,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -37,6 +42,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -47,12 +53,18 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.vlm_on_mobile.camera.CameraPreview
 import com.example.vlm_on_mobile.detection.DetectorInput
 import com.example.vlm_on_mobile.detection.YoloWorldDetector
+import com.example.vlm_on_mobile.events.AppEvent
+import com.example.vlm_on_mobile.events.EventBuffer
 import com.example.vlm_on_mobile.gemma.GemmaNarrator
 import com.example.vlm_on_mobile.gemma.GemmaState
+import com.example.vlm_on_mobile.motion.MotionState
+import com.example.vlm_on_mobile.motion.MotionTracker
+import com.example.vlm_on_mobile.narrator.TemplateNarrator
 import com.example.vlm_on_mobile.orientation.BearingProjector
 import com.example.vlm_on_mobile.orientation.BearingResult
 import com.example.vlm_on_mobile.orientation.OrientationSample
@@ -60,10 +72,13 @@ import com.example.vlm_on_mobile.orientation.OrientationTracker
 import com.example.vlm_on_mobile.tracking.MapEntry
 import com.example.vlm_on_mobile.tracking.ObjectTracker
 import com.example.vlm_on_mobile.tracking.SpatialDirectionMap
+import com.example.vlm_on_mobile.transcript.TranscriptRecord
+import com.example.vlm_on_mobile.transcript.TranscriptWriter
 import com.example.vlm_on_mobile.ui.DetectedBoxOverlay
 import com.example.vlm_on_mobile.ui.DetectionOverlay
 import com.example.vlm_on_mobile.ui.OrientationOverlay
 import com.example.vlm_on_mobile.ui.theme.VLM_on_mobileTheme
+import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -72,9 +87,14 @@ class MainActivity : ComponentActivity() {
 
     private lateinit var gemmaNarrator: GemmaNarrator
     private lateinit var orientationTracker: OrientationTracker
+    private lateinit var transcriptWriter: TranscriptWriter
+    private lateinit var templateNarrator: TemplateNarrator
+
     private var detector: YoloWorldDetector? = null
     private val objectTracker = ObjectTracker()
     private val directionMap = SpatialDirectionMap()
+    private val motionTracker = MotionTracker()
+    private val eventBuffer = EventBuffer()
 
     private val requestCameraPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
@@ -89,6 +109,10 @@ class MainActivity : ComponentActivity() {
 
         gemmaNarrator = GemmaNarrator(applicationContext)
         orientationTracker = OrientationTracker(applicationContext)
+        transcriptWriter = TranscriptWriter(applicationContext)
+        templateNarrator = TemplateNarrator(transcriptWriter)
+
+        transcriptWriter.startSession()
 
         try {
             detector = YoloWorldDetector(applicationContext, useGpu = false)
@@ -127,7 +151,10 @@ class MainActivity : ComponentActivity() {
                                 orientationTracker = orientationTracker,
                                 detector = detector,
                                 objectTracker = objectTracker,
-                                directionMap = directionMap
+                                directionMap = directionMap,
+                                motionTracker = motionTracker,
+                                eventBuffer = eventBuffer,
+                                templateNarrator = templateNarrator
                             )
                             1 -> GemmaBenchmarkScreen(narrator = gemmaNarrator)
                         }
@@ -153,6 +180,9 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         gemmaNarrator.close()
         detector?.close()
+        lifecycleScope.launch {
+            transcriptWriter.stopSession()
+        }
     }
 }
 
@@ -161,12 +191,16 @@ fun SpatialTrackerScreen(
     orientationTracker: OrientationTracker,
     detector: YoloWorldDetector?,
     objectTracker: ObjectTracker,
-    directionMap: SpatialDirectionMap
+    directionMap: SpatialDirectionMap,
+    motionTracker: MotionTracker,
+    eventBuffer: EventBuffer,
+    templateNarrator: TemplateNarrator
 ) {
     var currentSample by remember { mutableStateOf<OrientationSample?>(null) }
     var centerBearing by remember { mutableStateOf<BearingResult?>(null) }
     var boxOverlays by remember { mutableStateOf<List<DetectedBoxOverlay>>(emptyList()) }
     var mapEntries by remember { mutableStateOf<List<MapEntry>>(emptyList()) }
+    val transcriptLines = remember { mutableStateListOf<String>() }
 
     var isProcessingFrame by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -192,6 +226,27 @@ fun SpatialTrackerScreen(
                     )
                     centerBearing = cameraCenter
 
+                    // Motion state update
+                    sample?.let { s ->
+                        val timestampMs = System.currentTimeMillis()
+                        val motionStatus = motionTracker.update(s, timestampMs)
+
+                        // If moving, check template narrator flush
+                        if (motionStatus.state == MotionState.MOVING) {
+                            val line = templateNarrator.onRotationSegment(
+                                yawDeltaDeg = motionStatus.yawDeltaDeg,
+                                pitchDeltaDeg = motionStatus.pitchDeltaDeg,
+                                timestampMs = timestampMs
+                            )
+                            if (line != null) {
+                                scope.launch(Dispatchers.Main) {
+                                    transcriptLines.add(0, line)
+                                }
+                                motionTracker.resetRotationAccumulator()
+                            }
+                        }
+                    }
+
                     // Trigger detection pipeline on frame if non-busy
                     if (detector != null && !isProcessingFrame) {
                         isProcessingFrame = true
@@ -199,7 +254,6 @@ fun SpatialTrackerScreen(
 
                         scope.launch(Dispatchers.Default) {
                             try {
-                                // Synthetic frame test bitmap for detector input
                                 val bmp = Bitmap.createBitmap(640, 640, Bitmap.Config.ARGB_8888)
                                 val frameRes = detector.detect(DetectorInput.Bmp(bmp))
 
@@ -226,6 +280,16 @@ fun SpatialTrackerScreen(
                                     cameraCenterBearing = cameraCenter,
                                     timestampMs = timestampMs
                                 )
+
+                                // Notify new map entries
+                                for (newEntry in mapResult.newEntries) {
+                                    eventBuffer.emit(AppEvent.ObjectNew(newEntry))
+                                    templateNarrator.onNewObject(newEntry)
+                                }
+
+                                for (lostEntry in mapResult.lostEntries) {
+                                    eventBuffer.emit(AppEvent.ObjectLost(lostEntry))
+                                }
 
                                 withContext(Dispatchers.Main) {
                                     boxOverlays = trackedPairs.map { (track, bearing) ->
@@ -256,6 +320,42 @@ fun SpatialTrackerScreen(
             mapEntries = mapEntries,
             modifier = Modifier.fillMaxSize()
         )
+
+        // Bottom Transcript Stream Feed HUD
+        if (transcriptLines.isNotEmpty()) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .padding(16.dp)
+                    .width(320.dp)
+                    .background(
+                        color = androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.85f),
+                        shape = RoundedCornerShape(8.dp)
+                    )
+                    .padding(12.dp)
+            ) {
+                Column {
+                    Text(
+                        text = "Live Narration Transcript",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = androidx.compose.ui.graphics.Color.Yellow,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    LazyColumn(modifier = Modifier.height(100.dp)) {
+                        items(transcriptLines) { line ->
+                            Text(
+                                text = line,
+                                color = androidx.compose.ui.graphics.Color.White,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 12.sp,
+                                modifier = Modifier.padding(vertical = 2.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
