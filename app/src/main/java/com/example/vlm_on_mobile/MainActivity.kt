@@ -55,13 +55,17 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.example.vlm_on_mobile.camera.CameraPreview
 import com.example.vlm_on_mobile.detection.DetectorInput
 import com.example.vlm_on_mobile.detection.YoloWorldDetector
 import com.example.vlm_on_mobile.events.AppEvent
 import com.example.vlm_on_mobile.events.EventBuffer
+import com.example.vlm_on_mobile.gemma.FrameRingBuffer
 import com.example.vlm_on_mobile.gemma.GemmaNarrator
+import com.example.vlm_on_mobile.gemma.GemmaScheduler
 import com.example.vlm_on_mobile.gemma.GemmaState
+import com.example.vlm_on_mobile.gemma.GemmaVerifier
 import com.example.vlm_on_mobile.motion.MotionState
 import com.example.vlm_on_mobile.motion.MotionTracker
 import com.example.vlm_on_mobile.narrator.TemplateNarrator
@@ -72,13 +76,11 @@ import com.example.vlm_on_mobile.orientation.OrientationTracker
 import com.example.vlm_on_mobile.tracking.MapEntry
 import com.example.vlm_on_mobile.tracking.ObjectTracker
 import com.example.vlm_on_mobile.tracking.SpatialDirectionMap
-import com.example.vlm_on_mobile.transcript.TranscriptRecord
 import com.example.vlm_on_mobile.transcript.TranscriptWriter
 import com.example.vlm_on_mobile.ui.DetectedBoxOverlay
 import com.example.vlm_on_mobile.ui.DetectionOverlay
 import com.example.vlm_on_mobile.ui.OrientationOverlay
 import com.example.vlm_on_mobile.ui.theme.VLM_on_mobileTheme
-import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -89,6 +91,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var orientationTracker: OrientationTracker
     private lateinit var transcriptWriter: TranscriptWriter
     private lateinit var templateNarrator: TemplateNarrator
+    private lateinit var ringBuffer: FrameRingBuffer
+    private lateinit var gemmaScheduler: GemmaScheduler
+    private lateinit var gemmaVerifier: GemmaVerifier
 
     private var detector: YoloWorldDetector? = null
     private val objectTracker = ObjectTracker()
@@ -111,6 +116,9 @@ class MainActivity : ComponentActivity() {
         orientationTracker = OrientationTracker(applicationContext)
         transcriptWriter = TranscriptWriter(applicationContext)
         templateNarrator = TemplateNarrator(transcriptWriter)
+        ringBuffer = FrameRingBuffer()
+        gemmaScheduler = GemmaScheduler(gemmaNarrator, transcriptWriter, ringBuffer, eventBuffer)
+        gemmaVerifier = GemmaVerifier(gemmaNarrator, transcriptWriter, eventBuffer)
 
         transcriptWriter.startSession()
 
@@ -135,7 +143,7 @@ class MainActivity : ComponentActivity() {
                             Tab(
                                 selected = selectedTabIndex == 0,
                                 onClick = { selectedTabIndex = 0 },
-                                text = { Text("Spatial Tracker") }
+                                text = { Text("Dual Narrator Pipeline") }
                             )
                             Tab(
                                 selected = selectedTabIndex == 1,
@@ -147,14 +155,16 @@ class MainActivity : ComponentActivity() {
                 ) { innerPadding ->
                     Box(modifier = Modifier.padding(innerPadding)) {
                         when (selectedTabIndex) {
-                            0 -> SpatialTrackerScreen(
+                            0 -> DualNarratorPipelineScreen(
                                 orientationTracker = orientationTracker,
                                 detector = detector,
                                 objectTracker = objectTracker,
                                 directionMap = directionMap,
                                 motionTracker = motionTracker,
                                 eventBuffer = eventBuffer,
-                                templateNarrator = templateNarrator
+                                templateNarrator = templateNarrator,
+                                ringBuffer = ringBuffer,
+                                gemmaScheduler = gemmaScheduler
                             )
                             1 -> GemmaBenchmarkScreen(narrator = gemmaNarrator)
                         }
@@ -180,6 +190,7 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         gemmaNarrator.close()
         detector?.close()
+        ringBuffer.clear()
         lifecycleScope.launch {
             transcriptWriter.stopSession()
         }
@@ -187,14 +198,16 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun SpatialTrackerScreen(
+fun DualNarratorPipelineScreen(
     orientationTracker: OrientationTracker,
     detector: YoloWorldDetector?,
     objectTracker: ObjectTracker,
     directionMap: SpatialDirectionMap,
     motionTracker: MotionTracker,
     eventBuffer: EventBuffer,
-    templateNarrator: TemplateNarrator
+    templateNarrator: TemplateNarrator,
+    ringBuffer: FrameRingBuffer,
+    gemmaScheduler: GemmaScheduler
 ) {
     var currentSample by remember { mutableStateOf<OrientationSample?>(null) }
     var centerBearing by remember { mutableStateOf<BearingResult?>(null) }
@@ -203,6 +216,7 @@ fun SpatialTrackerScreen(
     val transcriptLines = remember { mutableStateListOf<String>() }
 
     var isProcessingFrame by remember { mutableStateOf(false) }
+    var lastMotionState by remember { mutableStateOf(MotionState.IDLE) }
     val scope = rememberCoroutineScope()
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -226,25 +240,52 @@ fun SpatialTrackerScreen(
                     )
                     centerBearing = cameraCenter
 
-                    // Motion state update
+                    // Motion state update & Ring Buffer
                     sample?.let { s ->
                         val timestampMs = System.currentTimeMillis()
                         val motionStatus = motionTracker.update(s, timestampMs)
 
-                        // If moving, check template narrator flush
+                        // Add frame to ring buffer
+                        val bmp = Bitmap.createBitmap(640, 640, Bitmap.Config.ARGB_8888)
+                        ringBuffer.addFrame(
+                            timestampNs = frameData.timestampNs,
+                            bitmap = bmp,
+                            angularSpeedDegPerSec = motionStatus.angularSpeedDegPerSec,
+                            rotationMatrix = currentRotMatrix
+                        )
+
+                        // State transition to SETTLED -> Trigger Gemma Scheduler
+                        if (motionStatus.state == MotionState.SETTLED && lastMotionState == MotionState.MOVING) {
+                            val activeHints = mapEntries.map { it.label }
+                            val (yawRot, pitchRot) = motionTracker.resetRotationAccumulator()
+
+                            gemmaScheduler.triggerScheduledDescription(
+                                detectorHints = activeHints,
+                                yawDeltaDeg = yawRot,
+                                pitchDeltaDeg = pitchRot
+                            ) { gemmaText ->
+                                scope.launch(Dispatchers.Main) {
+                                    transcriptLines.add(0, "[Gemma] $gemmaText")
+                                }
+                            }
+                        }
+
+                        // While MOVING -> Run Template Narrator
                         if (motionStatus.state == MotionState.MOVING) {
-                            val line = templateNarrator.onRotationSegment(
+                            val templateLine = templateNarrator.onRotationSegment(
                                 yawDeltaDeg = motionStatus.yawDeltaDeg,
                                 pitchDeltaDeg = motionStatus.pitchDeltaDeg,
                                 timestampMs = timestampMs
                             )
-                            if (line != null) {
+                            if (templateLine != null) {
                                 scope.launch(Dispatchers.Main) {
-                                    transcriptLines.add(0, line)
+                                    transcriptLines.add(0, "[Template] $templateLine")
                                 }
                                 motionTracker.resetRotationAccumulator()
                             }
                         }
+
+                        lastMotionState = motionStatus.state
                     }
 
                     // Trigger detection pipeline on frame if non-busy
@@ -281,7 +322,6 @@ fun SpatialTrackerScreen(
                                     timestampMs = timestampMs
                                 )
 
-                                // Notify new map entries
                                 for (newEntry in mapResult.newEntries) {
                                     eventBuffer.emit(AppEvent.ObjectNew(newEntry))
                                     templateNarrator.onNewObject(newEntry)
@@ -327,7 +367,7 @@ fun SpatialTrackerScreen(
                 modifier = Modifier
                     .align(Alignment.BottomStart)
                     .padding(16.dp)
-                    .width(320.dp)
+                    .width(340.dp)
                     .background(
                         color = androidx.compose.ui.graphics.Color.Black.copy(alpha = 0.85f),
                         shape = RoundedCornerShape(8.dp)
@@ -336,13 +376,13 @@ fun SpatialTrackerScreen(
             ) {
                 Column {
                     Text(
-                        text = "Live Narration Transcript",
+                        text = "Live Narration Stream",
                         style = MaterialTheme.typography.titleSmall,
                         color = androidx.compose.ui.graphics.Color.Yellow,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(4.dp))
-                    LazyColumn(modifier = Modifier.height(100.dp)) {
+                    LazyColumn(modifier = Modifier.height(110.dp)) {
                         items(transcriptLines) { line ->
                             Text(
                                 text = line,
