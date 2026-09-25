@@ -1,14 +1,20 @@
 package com.example.vlm_on_mobile
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.os.Bundle
+import android.view.Surface
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -25,10 +31,13 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -39,36 +48,125 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import com.example.vlm_on_mobile.camera.CameraPreview
 import com.example.vlm_on_mobile.gemma.GemmaNarrator
 import com.example.vlm_on_mobile.gemma.GemmaState
+import com.example.vlm_on_mobile.orientation.BearingProjector
+import com.example.vlm_on_mobile.orientation.BearingResult
+import com.example.vlm_on_mobile.orientation.OrientationSample
+import com.example.vlm_on_mobile.orientation.OrientationTracker
+import com.example.vlm_on_mobile.ui.OrientationOverlay
 import com.example.vlm_on_mobile.ui.theme.VLM_on_mobileTheme
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var gemmaNarrator: GemmaNarrator
+    private lateinit var orientationTracker: OrientationTracker
+
+    private val requestCameraPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
+            if (!isGranted) {
+                Toast.makeText(this, "Camera permission is required for spatial view", Toast.LENGTH_LONG).show()
+            }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
         gemmaNarrator = GemmaNarrator(applicationContext)
+        orientationTracker = OrientationTracker(applicationContext)
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestCameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+        }
 
         setContent {
             VLM_on_mobileTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-                    GemmaBenchmarkScreen(
-                        narrator = gemmaNarrator,
-                        modifier = Modifier.padding(innerPadding)
-                    )
+                var selectedTabIndex by remember { mutableIntStateOf(0) }
+
+                Scaffold(
+                    modifier = Modifier.fillMaxSize(),
+                    topBar = {
+                        TabRow(selectedTabIndex = selectedTabIndex) {
+                            Tab(
+                                selected = selectedTabIndex == 0,
+                                onClick = { selectedTabIndex = 0 },
+                                text = { Text("Orientation HUD") }
+                            )
+                            Tab(
+                                selected = selectedTabIndex == 1,
+                                onClick = { selectedTabIndex = 1 },
+                                text = { Text("Gemma 4 Test") }
+                            )
+                        }
+                    }
+                ) { innerPadding ->
+                    Box(modifier = Modifier.padding(innerPadding)) {
+                        when (selectedTabIndex) {
+                            0 -> OrientationHudScreen(orientationTracker = orientationTracker)
+                            1 -> GemmaBenchmarkScreen(narrator = gemmaNarrator)
+                        }
+                    }
                 }
             }
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        @Suppress("DEPRECATION")
+        orientationTracker.displayRotation = windowManager.defaultDisplay.rotation
+        orientationTracker.start()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        orientationTracker.stop()
+    }
+
     override fun onDestroy() {
         super.onDestroy()
         gemmaNarrator.close()
+    }
+}
+
+@Composable
+fun OrientationHudScreen(orientationTracker: OrientationTracker) {
+    var currentSample by remember { mutableStateOf<OrientationSample?>(null) }
+    var centerBearing by remember { mutableStateOf<BearingResult?>(null) }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        CameraPreview(
+            modifier = Modifier.fillMaxSize(),
+            onFrameAnalyzed = { frameData ->
+                val sample = orientationTracker.getSampleAtTimestamp(frameData.timestampNs)
+                currentSample = sample ?: orientationTracker.currentSample
+
+                val currentRotMatrix = sample?.rotationMatrix ?: orientationTracker.currentSample?.rotationMatrix
+                val intrinsics = frameData.intrinsics
+
+                if (currentRotMatrix != null && intrinsics != null) {
+                    val cx = intrinsics.cx
+                    val cy = intrinsics.cy
+                    centerBearing = BearingProjector.projectPixelToWorldBearing(
+                        u = cx,
+                        v = cy,
+                        intrinsics = intrinsics,
+                        rotationMatrix = currentRotMatrix
+                    )
+                }
+            }
+        )
+
+        OrientationOverlay(
+            currentSample = currentSample,
+            centerBearing = centerBearing,
+            onResetYaw = { orientationTracker.zeroYaw() },
+            modifier = Modifier.fillMaxSize()
+        )
     }
 }
 
@@ -85,7 +183,6 @@ fun GemmaBenchmarkScreen(
     var lastLatencyMs by remember { mutableStateOf<Long?>(null) }
     var isRunningInference by remember { mutableStateOf(false) }
 
-    // Generate a simple synthetic test image
     val testBitmap = remember {
         val bmp = Bitmap.createBitmap(512, 512, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(bmp)
@@ -116,7 +213,6 @@ fun GemmaBenchmarkScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Status Card
         Card(
             modifier = Modifier.fillMaxWidth(),
             colors = CardDefaults.cardColors(
@@ -141,13 +237,13 @@ fun GemmaBenchmarkScreen(
                             }
                         } else {
                             Text(
-                                text = "Model File NOT Found on Device!\n\nPlease push '${GemmaNarrator.MODEL_FILENAME}' to:\n/sdcard/Android/data/com.example.vlm_on_mobile/files/",
+                                text = "Model File NOT Found on Device!\n\nPlease push '${GemmaNarrator.MODEL_FILENAME}' to app storage.",
                                 color = MaterialTheme.colorScheme.error
                             )
                         }
                     }
                     is GemmaState.Initializing -> {
-                        RowVerticalCenter {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             CircularProgressIndicator()
                             Text(" Initializing LiteRT-LM Engine on GPU...")
                         }
@@ -177,7 +273,6 @@ fun GemmaBenchmarkScreen(
 
         Spacer(modifier = Modifier.height(16.dp))
 
-        // Test Input Section
         if (state is GemmaState.Ready) {
             Text(
                 text = "Test Synthetic Input Frame:",
@@ -264,14 +359,5 @@ fun GemmaBenchmarkScreen(
                 }
             }
         }
-    }
-}
-
-@Composable
-private fun RowVerticalCenter(content: @Composable () -> Unit) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        content()
     }
 }
