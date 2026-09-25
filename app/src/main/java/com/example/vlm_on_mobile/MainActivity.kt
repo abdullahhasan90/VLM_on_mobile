@@ -7,7 +7,6 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.os.Bundle
-import android.view.Surface
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -50,20 +49,32 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import com.example.vlm_on_mobile.camera.CameraPreview
+import com.example.vlm_on_mobile.detection.DetectorInput
+import com.example.vlm_on_mobile.detection.YoloWorldDetector
 import com.example.vlm_on_mobile.gemma.GemmaNarrator
 import com.example.vlm_on_mobile.gemma.GemmaState
 import com.example.vlm_on_mobile.orientation.BearingProjector
 import com.example.vlm_on_mobile.orientation.BearingResult
 import com.example.vlm_on_mobile.orientation.OrientationSample
 import com.example.vlm_on_mobile.orientation.OrientationTracker
+import com.example.vlm_on_mobile.tracking.MapEntry
+import com.example.vlm_on_mobile.tracking.ObjectTracker
+import com.example.vlm_on_mobile.tracking.SpatialDirectionMap
+import com.example.vlm_on_mobile.ui.DetectedBoxOverlay
+import com.example.vlm_on_mobile.ui.DetectionOverlay
 import com.example.vlm_on_mobile.ui.OrientationOverlay
 import com.example.vlm_on_mobile.ui.theme.VLM_on_mobileTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var gemmaNarrator: GemmaNarrator
     private lateinit var orientationTracker: OrientationTracker
+    private var detector: YoloWorldDetector? = null
+    private val objectTracker = ObjectTracker()
+    private val directionMap = SpatialDirectionMap()
 
     private val requestCameraPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { isGranted ->
@@ -78,6 +89,12 @@ class MainActivity : ComponentActivity() {
 
         gemmaNarrator = GemmaNarrator(applicationContext)
         orientationTracker = OrientationTracker(applicationContext)
+
+        try {
+            detector = YoloWorldDetector(applicationContext, useGpu = false)
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestCameraPermissionLauncher.launch(Manifest.permission.CAMERA)
@@ -94,7 +111,7 @@ class MainActivity : ComponentActivity() {
                             Tab(
                                 selected = selectedTabIndex == 0,
                                 onClick = { selectedTabIndex = 0 },
-                                text = { Text("Orientation HUD") }
+                                text = { Text("Spatial Tracker") }
                             )
                             Tab(
                                 selected = selectedTabIndex == 1,
@@ -106,7 +123,12 @@ class MainActivity : ComponentActivity() {
                 ) { innerPadding ->
                     Box(modifier = Modifier.padding(innerPadding)) {
                         when (selectedTabIndex) {
-                            0 -> OrientationHudScreen(orientationTracker = orientationTracker)
+                            0 -> SpatialTrackerScreen(
+                                orientationTracker = orientationTracker,
+                                detector = detector,
+                                objectTracker = objectTracker,
+                                directionMap = directionMap
+                            )
                             1 -> GemmaBenchmarkScreen(narrator = gemmaNarrator)
                         }
                     }
@@ -130,13 +152,24 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         gemmaNarrator.close()
+        detector?.close()
     }
 }
 
 @Composable
-fun OrientationHudScreen(orientationTracker: OrientationTracker) {
+fun SpatialTrackerScreen(
+    orientationTracker: OrientationTracker,
+    detector: YoloWorldDetector?,
+    objectTracker: ObjectTracker,
+    directionMap: SpatialDirectionMap
+) {
     var currentSample by remember { mutableStateOf<OrientationSample?>(null) }
     var centerBearing by remember { mutableStateOf<BearingResult?>(null) }
+    var boxOverlays by remember { mutableStateOf<List<DetectedBoxOverlay>>(emptyList()) }
+    var mapEntries by remember { mutableStateOf<List<MapEntry>>(emptyList()) }
+
+    var isProcessingFrame by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     Box(modifier = Modifier.fillMaxSize()) {
         CameraPreview(
@@ -151,12 +184,62 @@ fun OrientationHudScreen(orientationTracker: OrientationTracker) {
                 if (currentRotMatrix != null && intrinsics != null) {
                     val cx = intrinsics.cx
                     val cy = intrinsics.cy
-                    centerBearing = BearingProjector.projectPixelToWorldBearing(
+                    val cameraCenter = BearingProjector.projectPixelToWorldBearing(
                         u = cx,
                         v = cy,
                         intrinsics = intrinsics,
                         rotationMatrix = currentRotMatrix
                     )
+                    centerBearing = cameraCenter
+
+                    // Trigger detection pipeline on frame if non-busy
+                    if (detector != null && !isProcessingFrame) {
+                        isProcessingFrame = true
+                        val timestampMs = System.currentTimeMillis()
+
+                        scope.launch(Dispatchers.Default) {
+                            try {
+                                // Synthetic frame test bitmap for detector input
+                                val bmp = Bitmap.createBitmap(640, 640, Bitmap.Config.ARGB_8888)
+                                val frameRes = detector.detect(DetectorInput.Bmp(bmp))
+
+                                val confirmedTracks = objectTracker.update(
+                                    detections = frameRes.detections,
+                                    labels = detector.labels,
+                                    timestampMs = timestampMs
+                                )
+
+                                val trackedPairs = confirmedTracks.map { track ->
+                                    val boxCenterU = (track.currentBox.left + track.currentBox.right) / 2f * intrinsics.cx * 2f
+                                    val boxCenterV = (track.currentBox.top + track.currentBox.bottom) / 2f * intrinsics.cy * 2f
+                                    val bearing = BearingProjector.projectPixelToWorldBearing(
+                                        u = boxCenterU,
+                                        v = boxCenterV,
+                                        intrinsics = intrinsics,
+                                        rotationMatrix = currentRotMatrix
+                                    )
+                                    track to bearing
+                                }
+
+                                val mapResult = directionMap.update(
+                                    trackedObjects = trackedPairs,
+                                    cameraCenterBearing = cameraCenter,
+                                    timestampMs = timestampMs
+                                )
+
+                                withContext(Dispatchers.Main) {
+                                    boxOverlays = trackedPairs.map { (track, bearing) ->
+                                        DetectedBoxOverlay(track, bearing.azimuthDeg, bearing.elevationDeg)
+                                    }
+                                    mapEntries = mapResult.allEntries
+                                }
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            } finally {
+                                isProcessingFrame = false
+                            }
+                        }
+                    }
                 }
             }
         )
@@ -165,6 +248,12 @@ fun OrientationHudScreen(orientationTracker: OrientationTracker) {
             currentSample = currentSample,
             centerBearing = centerBearing,
             onResetYaw = { orientationTracker.zeroYaw() },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        DetectionOverlay(
+            boxes = boxOverlays,
+            mapEntries = mapEntries,
             modifier = Modifier.fillMaxSize()
         )
     }
