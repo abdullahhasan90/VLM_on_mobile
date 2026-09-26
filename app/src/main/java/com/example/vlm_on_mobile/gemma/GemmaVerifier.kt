@@ -1,8 +1,8 @@
 package com.example.vlm_on_mobile.gemma
 
 import android.graphics.Bitmap
-import android.graphics.RectF
 import android.util.Log
+import com.example.vlm_on_mobile.detection.BoundingBox
 import com.example.vlm_on_mobile.events.AppEvent
 import com.example.vlm_on_mobile.events.EventBuffer
 import com.example.vlm_on_mobile.tracking.MapEntry
@@ -26,7 +26,7 @@ class GemmaVerifier(
     suspend fun verifyEntry(
         entry: MapEntry,
         fullFrame: Bitmap,
-        box: RectF
+        box: BoundingBox
     ): VerificationState = withContext(Dispatchers.Default) {
         val cropped = cropBoxWithMargin(fullFrame, box, marginFactor = 0.2f)
         val prompt = "Is there a ${entry.label} in this image? Answer only yes or no."
@@ -71,7 +71,7 @@ class GemmaVerifier(
         )
     }
 
-    private fun cropBoxWithMargin(bitmap: Bitmap, box: RectF, marginFactor: Float): Bitmap {
+    private fun cropBoxWithMargin(bitmap: Bitmap, box: BoundingBox, marginFactor: Float): Bitmap {
         val w = bitmap.width.toFloat()
         val h = bitmap.height.toFloat()
 

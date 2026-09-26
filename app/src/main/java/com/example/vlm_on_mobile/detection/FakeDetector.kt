@@ -1,6 +1,5 @@
 package com.example.vlm_on_mobile.detection
 
-import android.graphics.RectF
 import kotlin.random.Random
 
 class FakeDetector(override val labels: List<String>) : Detector {
@@ -15,7 +14,7 @@ class FakeDetector(override val labels: List<String>) : Detector {
             val y = random.nextFloat() * (1f - h)
 
             Detection(
-                box = RectF(x, y, x + w, y + h),
+                box = BoundingBox(x, y, x + w, y + h),
                 labelIndex = random.nextInt(labels.size),
                 score = random.nextFloat() * 0.6f + 0.3f
             )

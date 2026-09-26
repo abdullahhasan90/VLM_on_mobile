@@ -3,7 +3,7 @@ package com.example.vlm_on_mobile.narrator
 import com.example.vlm_on_mobile.tracking.MapEntry
 import com.example.vlm_on_mobile.transcript.TranscriptWriter
 
-class TemplateNarrator(private val transcriptWriter: TranscriptWriter) {
+class TemplateNarrator(private val transcriptWriter: TranscriptWriter? = null) {
 
     private val pendingNewObjects = mutableListOf<MapEntry>()
     private var lastFlushTimeMs: Long = 0L
@@ -57,7 +57,7 @@ class TemplateNarrator(private val transcriptWriter: TranscriptWriter) {
         val avgEl = pendingNewObjects.map { it.elevationDeg }.average().toFloat()
         val objectIds = pendingNewObjects.map { it.id }
 
-        transcriptWriter.writeRecord(
+        transcriptWriter?.writeRecord(
             source = "template",
             text = textLine,
             azimuth = avgAz,

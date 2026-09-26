@@ -1,10 +1,15 @@
 package com.example.vlm_on_mobile.detection
 
-import android.graphics.RectF
+data class BoundingBox(
+    val left: Float,
+    val top: Float,
+    val right: Float,
+    val bottom: Float
+)
 
 data class Detection(
     /** Normalized 0..1 in SOURCE IMAGE space. */
-    val box: RectF,
+    val box: BoundingBox,
     val labelIndex: Int,
     val score: Float,
 )

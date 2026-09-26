@@ -1,6 +1,6 @@
 package com.example.vlm_on_mobile.tracking
 
-import android.graphics.RectF
+import com.example.vlm_on_mobile.detection.BoundingBox
 import com.example.vlm_on_mobile.detection.Detection
 import kotlin.math.max
 import kotlin.math.min
@@ -9,7 +9,7 @@ data class TrackedObject(
     val trackId: Int,
     val labelIndex: Int,
     val label: String,
-    var currentBox: RectF,
+    var currentBox: BoundingBox,
     var confidence: Float,
     val firstSeenMs: Long,
     var lastSeenMs: Long,
@@ -96,16 +96,20 @@ class ObjectTracker(
         return activeTracks.filter { it.isConfirmed }
     }
 
-    private fun calculateIoU(b1: RectF, b2: RectF): Float {
-        val interLeft = max(b1.left, b2.left)
-        val interTop = max(b1.top, b2.top)
-        val interRight = min(b1.right, b2.right)
-        val interBottom = min(b1.bottom, b2.bottom)
+    private fun calculateIoU(b1: BoundingBox, b2: BoundingBox): Float {
+        return calculateIoU(b1.left, b1.top, b1.right, b1.bottom, b2.left, b2.top, b2.right, b2.bottom)
+    }
+
+    private fun calculateIoU(l1: Float, t1: Float, r1: Float, b1: Float, l2: Float, t2: Float, r2: Float, b2: Float): Float {
+        val interLeft = max(l1, l2)
+        val interTop = max(t1, t2)
+        val interRight = min(r1, r2)
+        val interBottom = min(b1, b2)
 
         if (interLeft >= interRight || interTop >= interBottom) return 0f
         val interArea = (interRight - interLeft) * (interBottom - interTop)
-        val area1 = (b1.right - b1.left) * (b1.bottom - b1.top)
-        val area2 = (b2.right - b2.left) * (b2.bottom - b2.top)
+        val area1 = (r1 - l1) * (b1 - t1)
+        val area2 = (r2 - l2) * (b2 - t2)
 
         return interArea / (area1 + area2 - interArea)
     }

@@ -2,7 +2,6 @@ package com.example.vlm_on_mobile.detection
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.RectF
 import android.os.SystemClock
 import android.util.Log
 import org.tensorflow.lite.DataType
@@ -247,7 +246,7 @@ class YoloWorldDetector(
 
                 rawDetections.add(
                     Detection(
-                        RectF(l.coerceIn(0f, 1f), t.coerceIn(0f, 1f), r.coerceIn(0f, 1f), b.coerceIn(0f, 1f)),
+                        BoundingBox(l.coerceIn(0f, 1f), t.coerceIn(0f, 1f), r.coerceIn(0f, 1f), b.coerceIn(0f, 1f)),
                         classIdx,
                         finalScore
                     )
@@ -287,10 +286,14 @@ class YoloWorldDetector(
         return results
     }
 
-    private fun calculateIoU(b1: RectF, b2: RectF): Float {
-        val inter = RectF(maxOf(b1.left, b2.left), maxOf(b1.top, b2.top), minOf(b1.right, b2.right), minOf(b1.bottom, b2.bottom))
-        if (inter.left >= inter.right || inter.top >= inter.bottom) return 0f
-        val areaInter = (inter.right - inter.left) * (inter.bottom - inter.top)
+    private fun calculateIoU(b1: BoundingBox, b2: BoundingBox): Float {
+        val interLeft = maxOf(b1.left, b2.left)
+        val interTop = maxOf(b1.top, b2.top)
+        val interRight = minOf(b1.right, b2.right)
+        val interBottom = minOf(b1.bottom, b2.bottom)
+
+        if (interLeft >= interRight || interTop >= interBottom) return 0f
+        val areaInter = (interRight - interLeft) * (interBottom - interTop)
         return areaInter / ((b1.right - b1.left) * (b1.bottom - b1.top) + (b2.right - b2.left) * (b2.bottom - b2.top) - areaInter)
     }
 
